@@ -8,7 +8,7 @@ except ImportError:
     from langchain_community.embeddings import HuggingFaceEmbeddings
 
 class RAGSystem:
-    def __init__(self, data_dir=None):
+    def __init__(self, data_dir=None, embeddings=None):
         # Resolve data directory relative to this file's location
         if data_dir is None:
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,7 +16,8 @@ class RAGSystem:
         else:
             self.data_dir = data_dir
             
-        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        # Accept a shared model so the app loads it once for security + retrieval
+        self.embeddings = embeddings or HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         self.vector_store = None
         self._build_index()
 
