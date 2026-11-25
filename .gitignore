@@ -4,5 +4,5 @@ __pycache__/
 venv/
 .env
 logs/
-src/results.txt
+.pytest_cache/
 .DS_Store
