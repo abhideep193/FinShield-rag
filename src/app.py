@@ -5,7 +5,7 @@ import uuid
 import streamlit as st
 
 from audit import AuditLogger
-from rag import RAGSystem
+from rag import RAGSystem, confidence_label
 from security import SecurityManager, load_embeddings
 
 # --- Configuration ---
@@ -54,11 +54,18 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Audit Log (this session, last 5)")
+    chain_placeholder = st.empty()
     audit_placeholder = st.empty()
 
 
 def update_audit_display():
     """Redraw the audit panel with only this session's entries."""
+    chain_ok, _, chain_msg = audit_logger.verify_chain()
+    if chain_ok:
+        chain_placeholder.success(f"🔗 {chain_msg}")
+    else:
+        chain_placeholder.error(f"⚠️ Audit log tampered: {chain_msg}")
+
     logs = audit_logger.get_recent_logs(limit=5, session_id=session_id)
     with audit_placeholder.container():
         if not logs:
@@ -106,7 +113,7 @@ if prompt := st.chat_input("Ask a financial question..."):
         st.markdown(prompt)
 
     start_time = time.time()
-    retrieved_docs = []
+    scored_docs = []  # (doc, cosine similarity), best first
 
     # 2. Input security checks (L1 -> L2 -> L3)
     passed, security_outcome, reason = security_manager.validate(prompt)
@@ -117,8 +124,8 @@ if prompt := st.chat_input("Ask a financial question..."):
         response_text = f"Your query was flagged by our security system ({layer}). Reference ID: {session_id}"
     else:
         # 3. RAG Retrieval & Generation
-        retrieved_docs = rag_system.retrieve(prompt)
-        response_text = rag_system.generate_response(prompt, retrieved_docs)
+        scored_docs = rag_system.retrieve_with_scores(prompt)
+        response_text = rag_system.generate_response(prompt, [d for d, _ in scored_docs])
 
         # 4. Output check: make sure no canary token leaks into the answer
         out_ok, out_outcome, out_reason = security_manager.validate_response(response_text)
@@ -126,7 +133,7 @@ if prompt := st.chat_input("Ask a financial question..."):
             security_outcome = out_outcome
             layer_status["L3"].error(f"Layer 3: Canary Validator: OUTPUT BLOCKED - {out_reason}")
             response_text = f"The response was withheld by our security system (L3 output). Reference ID: {session_id}"
-            retrieved_docs = []
+            scored_docs = []
 
     latency = (time.time() - start_time) * 1000
 
@@ -136,7 +143,7 @@ if prompt := st.chat_input("Ask a financial question..."):
         user_role="customer",
         original_query=prompt,
         security_outcome=security_outcome,
-        retrieved_docs=[d.page_content[:50] + "..." for d in retrieved_docs],
+        retrieved_docs=[d.page_content[:50] + "..." for d, _ in scored_docs],
         final_response=response_text,
         latency_ms=latency
     )
@@ -155,8 +162,12 @@ if prompt := st.chat_input("Ask a financial question..."):
         }
 
         if security_outcome == "PASSED":
-            explainability["sources"] = [os.path.basename(d.metadata['source']) for d in retrieved_docs]
-            explainability["confidence"] = "High"  # Placeholder
+            top_similarity = scored_docs[0][1] if scored_docs else None
+            explainability["confidence"] = confidence_label(top_similarity)
+            explainability["sources"] = [
+                {"file": os.path.basename(d.metadata['source']), "similarity": round(sim, 3)}
+                for d, sim in scored_docs
+            ]
 
         with st.expander("Explainability & Audit Info"):
             st.json(explainability)

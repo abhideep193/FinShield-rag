@@ -7,6 +7,32 @@ try:
 except ImportError:
     from langchain_community.embeddings import HuggingFaceEmbeddings
 
+# Chunks below this cosine similarity to the query are treated as off-topic.
+# Measured on the sample data: relevant questions score ~0.30-0.60,
+# off-topic ones (weather, food, sport) score below ~0.13.
+MIN_SIMILARITY = 0.25
+
+# Confidence bands on the best chunk's cosine similarity
+CONFIDENCE_BANDS = [(0.50, "High"), (0.35, "Medium"), (MIN_SIMILARITY, "Low")]
+
+
+def distance_to_similarity(distance):
+    """Convert FAISS IndexFlatL2 output (squared L2) to cosine similarity.
+
+    For unit-length vectors ||a - b||^2 = 2 - 2*cos(a, b).
+    """
+    return 1.0 - float(distance) / 2.0
+
+
+def confidence_label(similarity):
+    if similarity is None:
+        return "None"
+    for threshold, label in CONFIDENCE_BANDS:
+        if similarity >= threshold:
+            return label
+    return "None"
+
+
 class RAGSystem:
     def __init__(self, data_dir=None, embeddings=None):
         # Resolve data directory relative to this file's location
@@ -15,9 +41,13 @@ class RAGSystem:
             self.data_dir = os.path.join(base_dir, "data")
         else:
             self.data_dir = data_dir
-            
-        # Accept a shared model so the app loads it once for security + retrieval
-        self.embeddings = embeddings or HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+        # Accept a shared model so the app loads it once for security + retrieval.
+        # Embeddings are normalised so FAISS distances map to cosine similarity.
+        self.embeddings = embeddings or HuggingFaceEmbeddings(
+            model_name="all-MiniLM-L6-v2",
+            encode_kwargs={"normalize_embeddings": True},
+        )
         self.vector_store = None
         self._build_index()
 
@@ -40,20 +70,22 @@ class RAGSystem:
         texts = text_splitter.split_documents(documents)
 
         self.vector_store = FAISS.from_documents(texts, self.embeddings)
-        
-    def retrieve(self, query, k=3, score_threshold=1.2):
-        """Return top-k docs whose FAISS L2 distance is below score_threshold.
-        
-        In FAISS (L2 distance), a *lower* score = more similar.
-        Documents with distance > score_threshold are considered off-topic
-        and are filtered out, enabling a graceful fallback for irrelevant queries.
+
+    def retrieve_with_scores(self, query, k=3, min_similarity=MIN_SIMILARITY):
+        """Return up to k (doc, cosine_similarity) pairs, best first.
+
+        Chunks below `min_similarity` are dropped so off-topic queries return
+        nothing and the caller can fall back gracefully.
         """
         if not self.vector_store:
             return []
         results = self.vector_store.similarity_search_with_score(query, k=k)
-        # Filter to only docs within the relevance threshold
-        relevant_docs = [doc for doc, score in results if score <= score_threshold]
-        return relevant_docs
+        scored = [(doc, distance_to_similarity(dist)) for doc, dist in results]
+        return [(doc, sim) for doc, sim in scored if sim >= min_similarity]
+
+    def retrieve(self, query, k=3, min_similarity=MIN_SIMILARITY):
+        """Return only the documents from `retrieve_with_scores`."""
+        return [doc for doc, _ in self.retrieve_with_scores(query, k, min_similarity)]
 
     def generate_response(self, query, context_docs):
         """Generate a response grounded in the retrieved document chunks."""

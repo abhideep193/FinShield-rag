@@ -11,7 +11,11 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 def load_embeddings():
     """Load the sentence-transformer model used by both security and retrieval."""
-    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    # Normalised vectors let rag.py turn FAISS L2 distances into cosine similarity
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
 
 # --- Layer 1: Lexical Filter ---
