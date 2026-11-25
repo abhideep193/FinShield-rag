@@ -1,7 +1,15 @@
+"""Tamper-evident audit logging with PII masking.
+
+Each log line stores `prev_hash` (the previous entry's hash) and `entry_hash`
+(SHA-256 of the entry itself). Editing, deleting or reordering any line breaks
+the chain, which `verify_chain()` detects. Run `python audit.py` to verify the log.
+"""
 import hashlib
 import json
 import os
 import re
+import sys
+import threading
 from collections import deque
 from datetime import datetime, timezone
 
@@ -9,6 +17,8 @@ from datetime import datetime, timezone
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SRC_DIR)
 AUDIT_LOG_FILE = os.path.join(_PROJECT_ROOT, "logs", "audit_trail.jsonl")
+
+GENESIS_HASH = "0" * 64
 
 # Order matters: longer number patterns run first so a card number is not
 # partly masked as an Aadhaar or phone number.
@@ -37,16 +47,52 @@ def mask_pii(text):
     return text
 
 
+def compute_entry_hash(entry):
+    """SHA-256 over every field except `entry_hash`, in a canonical JSON form."""
+    payload = {k: v for k, v in entry.items() if k != "entry_hash"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _read_last_line(path):
+    """Return the last non-empty line of a file without reading all of it."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        buf = b""
+        while pos > 0:
+            step = min(4096, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+            if buf.strip().count(b"\n") >= 1:
+                break
+    lines = buf.strip().splitlines()
+    return lines[-1].decode("utf-8") if lines else None
+
+
 class AuditLogger:
-    def __init__(self):
-        os.makedirs(os.path.dirname(AUDIT_LOG_FILE), exist_ok=True)
+    def __init__(self, log_file=None):
+        self.log_file = log_file or AUDIT_LOG_FILE
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        # Streamlit shares one logger across sessions; serialise appends so
+        # two writers never read the same prev_hash.
+        self._lock = threading.Lock()
+
+    def _last_hash(self):
+        if not os.path.exists(self.log_file):
+            return GENESIS_HASH
+        last = _read_last_line(self.log_file)
+        if not last:
+            return GENESIS_HASH
+        return json.loads(last).get("entry_hash", GENESIS_HASH)
 
     def log_query(self, session_id, user_role, original_query, security_outcome, retrieved_docs, final_response, latency_ms):
         timestamp = datetime.now(timezone.utc).isoformat()
 
         sanitized_query = self._mask_pii(original_query)
 
-        # Hash the response for immutability check
+        # Hash the response so the stored answer can be verified later
         response_hash = hashlib.sha256(final_response.encode('utf-8')).hexdigest() if final_response else None
 
         log_entry = {
@@ -58,11 +104,14 @@ class AuditLogger:
             "security_outcome": security_outcome,
             "retrieved_documents": retrieved_docs,
             "final_response_hash": response_hash,
-            "latency_ms": latency_ms
+            "latency_ms": latency_ms,
         }
 
-        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry) + "\n")
+        with self._lock:
+            log_entry["prev_hash"] = self._last_hash()
+            log_entry["entry_hash"] = compute_entry_hash(log_entry)
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
         return log_entry
 
@@ -75,8 +124,8 @@ class AuditLogger:
         The UI passes its own session_id so users never see each other's queries.
         """
         logs = deque(maxlen=limit)
-        if os.path.exists(AUDIT_LOG_FILE):
-            with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+        if os.path.exists(self.log_file):
+            with open(self.log_file, "r", encoding="utf-8") as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -84,3 +133,35 @@ class AuditLogger:
                     if session_id is None or entry.get("session_id") == session_id:
                         logs.append(entry)
         return list(logs)[::-1]
+
+    def verify_chain(self):
+        """Check every entry's hash and link. Returns (ok, entries_checked, message)."""
+        if not os.path.exists(self.log_file):
+            return True, 0, "No audit log yet"
+
+        expected_prev = GENESIS_HASH
+        count = 0
+        with open(self.log_file, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    return False, count, f"Line {line_no}: not valid JSON"
+                if "entry_hash" not in entry:
+                    return False, count, f"Line {line_no}: entry has no hash (written before chaining)"
+                if entry.get("prev_hash") != expected_prev:
+                    return False, count, f"Line {line_no}: chain broken (entry missing, inserted or reordered)"
+                if compute_entry_hash(entry) != entry["entry_hash"]:
+                    return False, count, f"Line {line_no}: contents modified"
+                expected_prev = entry["entry_hash"]
+                count += 1
+        return True, count, f"Chain intact ({count} entries)"
+
+
+if __name__ == "__main__":
+    path = sys.argv[1] if len(sys.argv) > 1 else None
+    ok, n, msg = AuditLogger(path).verify_chain()
+    print(("OK: " if ok else "TAMPERED: ") + msg)
+    sys.exit(0 if ok else 1)
